@@ -12,53 +12,181 @@ N_, C_, S_ = 0, 1, 2  # state ids: noise, continuation, transition onset
 # ----------------------------------------------------------------------------
 # Loading and splitting
 # ----------------------------------------------------------------------------
-def load_diginetica(path, min_item_count=5, val_frac=0.1, test_frac=0.1):
-    """Reads train-item-views.csv (';'-separated: sessionId, userId, itemId,
-    timeframe, eventdate). Returns (train, val, test, n_items); each split is a
-    list of (items[int array, 1..n_items], gaps[float array, seconds])."""
-    df = pd.read_csv(path, sep=";", usecols=["sessionId", "itemId", "timeframe", "eventdate"])
-    df = df.dropna()
-    df["eventdate"] = pd.to_datetime(df["eventdate"])
-    df = df.sort_values(["sessionId", "timeframe"], kind="stable")
-    same = (df["sessionId"] == df["sessionId"].shift()) & (df["itemId"] == df["itemId"].shift())
-    df = df[~same]  # drop consecutive repeats
-    counts = df["itemId"].value_counts()
-    df = df[df["itemId"].isin(counts[counts >= min_item_count].index)]
 
-    sess = []
+def load_diginetica(path, min_item_count=5, val_frac=0.1, test_frac=0.1):
+    """
+    Load Diginetica and split sessions chronologically.
+
+    Item-frequency filtering and vocabulary construction use
+    training sessions only.
+
+    Returns:
+        train, val, test, n_items
+
+    Each session:
+        (items: integer array, gaps: float array in seconds)
+    """
+
+    if min_item_count < 1:
+        raise ValueError("min_item_count must be >= 1")
+
+    if val_frac < 0 or test_frac < 0 or val_frac + test_frac >= 1:
+        raise ValueError("Invalid validation/test fractions")
+
+    df = pd.read_csv(
+        path,
+        sep=";",
+        usecols=["sessionId", "itemId", "timeframe", "eventdate"]
+    )
+
+    df = df.dropna(subset=[
+        "sessionId", "itemId", "timeframe", "eventdate"
+    ]).copy()
+
+    df["eventdate"] = pd.to_datetime(
+        df["eventdate"], errors="raise"
+    )
+
+    df = df.sort_values(
+        ["sessionId", "timeframe"],
+        kind="stable"
+    )
+
+    # Remove consecutive repeated item interactions.
+    same = (
+        (df["sessionId"] == df["sessionId"].shift()) &
+        (df["itemId"] == df["itemId"].shift())
+    )
+    df = df.loc[~same].copy()
+
+    # Build raw sessions BEFORE frequency filtering.
+    sessions = []
+
     for _, g in df.groupby("sessionId", sort=False):
+
         if len(g) < 2:
             continue
+
         t = g["timeframe"].to_numpy(dtype=float) / 1000.0
-        gaps = np.clip(np.diff(t, prepend=t[0]), 0, None)
-        end = g["eventdate"].iloc[0] + pd.Timedelta(seconds=float(t.max()))
-        sess.append((g["itemId"].to_numpy(), gaps, end))
 
-    sess.sort(key=lambda x: x[2])  # chronological by session end time
-    n = len(sess)
-    n_te, n_va = int(n * test_frac), int(n * val_frac)
-    tr, va, te = sess[: n - n_va - n_te], sess[n - n_va - n_te: n - n_te], sess[n - n_te:]
+        gaps = np.clip(
+            np.diff(t, prepend=t[0]),
+            0,
+            None
+        )
 
-    vocab = {it: i + 1 for i, it in enumerate(sorted(set(np.concatenate([s[0] for s in tr]).tolist())))}
+        end = (
+            g["eventdate"].iloc[0] +
+            pd.Timedelta(seconds=float(t.max()))
+        )
+
+        sessions.append((
+            g["itemId"].to_numpy(),
+            gaps,
+            end
+        ))
+
+    if not sessions:
+        raise ValueError("No valid sessions found in the dataset")
+
+    # Chronological split.
+    sessions.sort(key=lambda x: x[2])
+
+    n = len(sessions)
+    n_te = int(n * test_frac)
+    n_va = int(n * val_frac)
+
+    train_raw = sessions[: n - n_va - n_te]
+    val_raw = sessions[n - n_va - n_te: n - n_te]
+    test_raw = sessions[n - n_te:]
+
+    if not train_raw:
+        raise ValueError("Training split is empty")
+
+    # Calculate item frequencies ONLY from training sessions.
+    train_items = np.concatenate([
+        s[0] for s in train_raw
+    ])
+
+    counts = pd.Series(train_items).value_counts()
+
+    allowed_items = set(
+        counts[counts >= min_item_count].index.tolist()
+    )
+
+    # Vocabulary is constructed exclusively from training data.
+    vocab_items = sorted(allowed_items)
+
+    if not vocab_items:
+        raise ValueError(
+            "No training items remain after frequency filtering. "
+            "Try a lower min_item_count."
+        )
+
+    vocab = {
+        item: idx + 1
+        for idx, item in enumerate(vocab_items)
+    }
 
     def remap(part):
-        out = []
-        for it, gp, _ in part:
-            keep = np.array([x in vocab for x in it.tolist()], dtype=bool)  # drop unseen items
+
+        output = []
+
+        for items, gaps, _ in part:
+
+            keep = np.array(
+                [item in vocab for item in items.tolist()],
+                dtype=bool
+            )
+
             if keep.sum() < 2:
                 continue
-            out.append((np.array([vocab[x] for x in it[keep].tolist()]), gp[keep]))
-        return out
 
-    return remap(tr), remap(va), remap(te), len(vocab)
+            filtered_items = items[keep]
 
+            # Reconstruct elapsed time so that gaps between
+            # retained events include intervening removed events.
+            elapsed = np.cumsum(gaps)
+            retained_elapsed = elapsed[keep]
 
-def popularity_cdf(train, n_items):
-    cnt = np.zeros(n_items + 1)
-    for items, _ in train:
-        np.add.at(cnt, items, 1)
-    p = cnt[1:] / cnt[1:].sum()
-    return np.cumsum(p)
+            filtered_gaps = np.diff(
+                retained_elapsed,
+                prepend=retained_elapsed[0]
+            )
+
+            mapped_items = np.array([
+                vocab[item]
+                for item in filtered_items.tolist()
+            ], dtype=np.int64)
+
+            output.append((
+                mapped_items,
+                filtered_gaps.astype(np.float32)
+            ))
+
+        return output
+
+    train = remap(train_raw)
+    val = remap(val_raw)
+    test = remap(test_raw)
+
+    if not train:
+        raise ValueError(
+            "Training sessions became empty after filtering"
+        )
+
+    if not val:
+        raise ValueError(
+            "Validation sessions became empty after filtering"
+        )
+
+    if not test:
+        raise ValueError(
+            "Test sessions became empty after filtering"
+        )
+
+    return train, val, test, len(vocab)
+
 
 
 # ----------------------------------------------------------------------------
